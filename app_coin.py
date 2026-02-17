@@ -5,7 +5,12 @@ from typing import Optional, Dict
 import pandas as pd
 import streamlit as st
 
-from coin_valuer import db, match, pricing, utils, nn
+# Single-folder imports (no coin_valuer package)
+import db
+import match
+import pricing
+import utils
+import nn
 
 st.set_page_config(layout="wide", page_title="Coin Identifier & Valuer", page_icon="🪙")
 
