@@ -7,7 +7,7 @@ from typing import Dict, List, Optional, Tuple, Union
 import numpy as np
 import pandas as pd
 
-# Optional TensorFlow import (Streamlit Cloud may not have it)
+# Optional TensorFlow import (some deploy targets won't have it)
 try:
     import tensorflow as tf
     from tensorflow.keras import layers, models, optimizers
@@ -29,8 +29,9 @@ DEFAULT_METALS = [
 
 # Single-folder paths (save beside this file)
 BASE_DIR = Path(__file__).resolve().parent
-MODEL_PATH = str(BASE_DIR / "coin_metal_model.keras")
-META_PATH  = str(BASE_DIR / "coin_metal_model_meta.json")
+KERAS_MODEL_PATH = BASE_DIR / "coin_metal_model.keras"
+NP_MODEL_PATH    = BASE_DIR / "coin_metal_model_np.npz"
+META_PATH        = BASE_DIR / "coin_metal_model_meta.json"
 
 
 @dataclass
@@ -38,8 +39,9 @@ class TrainConfig:
     """Config object expected by app_coin.py."""
     epochs: int = 60
     metals: Optional[List[str]] = None
-    learning_rate: float = 0.002
+    learning_rate: float = 0.05      # used by numpy fallback; TF uses its own default unless overridden
     val_split: float = 0.15
+    l2: float = 1e-4                 # numpy fallback regularization
 
 
 # -------------------------------
@@ -92,8 +94,7 @@ def build_training_frame(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
     Uses metal_1..3 + pct_1..pct_3 as labels.
     """
     df = df.copy()
-    # CRITICAL: ensure contiguous 0..N-1 index so numpy indexing is safe
-    df = df.reset_index(drop=True)
+    df = df.reset_index(drop=True)  # ensure 0..N-1 indexing for numpy arrays
 
     metals = DEFAULT_METALS.copy()
     metal_to_idx = {m: i for i, m in enumerate(metals)}
@@ -138,7 +139,6 @@ def build_training_frame(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
     # ---- Labels ----
     Y = np.zeros((len(df), len(metals)), dtype=np.float32)
 
-    # enumerate ensures i is 0..N-1 even if df index was weird before reset
     for i, (_, r) in enumerate(df.iterrows()):
         for m_col, p_col in [("metal_1", "pct_1"), ("metal_2", "pct_2"), ("metal_3", "pct_3")]:
             m = str(r.get(m_col, "unknown")).strip().lower()
@@ -161,10 +161,82 @@ def build_training_frame(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
 
 
 # -------------------------------
-# Model
+# Numpy fallback model
 # -------------------------------
 
-def _build_model(input_dim: int, output_dim: int, learning_rate: float) -> "models.Model":
+def _softmax(z: np.ndarray) -> np.ndarray:
+    z = z - np.max(z, axis=1, keepdims=True)
+    e = np.exp(z)
+    s = np.sum(e, axis=1, keepdims=True)
+    s[s == 0] = 1.0
+    return e / s
+
+def _cross_entropy_soft_labels(P: np.ndarray, Y: np.ndarray) -> float:
+    eps = 1e-9
+    return float(-np.mean(np.sum(Y * np.log(P + eps), axis=1)))
+
+def _train_numpy_softmax_regression(
+    X: np.ndarray,
+    Y: np.ndarray,
+    epochs: int,
+    lr: float,
+    l2: float,
+    seed: int = 7
+) -> Tuple[np.ndarray, np.ndarray, Dict[str, float]]:
+    """
+    Multinomial logistic regression (softmax regression) with soft labels.
+    """
+    rng = np.random.default_rng(seed)
+    n, d = X.shape
+    k = Y.shape[1]
+
+    # Simple standardization helps stability (persist stats in meta)
+    mu = X.mean(axis=0, keepdims=True)
+    sd = X.std(axis=0, keepdims=True)
+    sd[sd == 0] = 1.0
+    Xn = (X - mu) / sd
+
+    W = rng.normal(0, 0.01, size=(d, k)).astype(np.float32)
+    b = np.zeros((1, k), dtype=np.float32)
+
+    best_loss = float("inf")
+    for _ in range(max(1, int(epochs))):
+        logits = Xn @ W + b
+        P = _softmax(logits)
+        loss = _cross_entropy_soft_labels(P, Y) + float(l2) * float(np.sum(W * W))
+
+        # gradients
+        # dL/dlogits = (P - Y)/n
+        G = (P - Y) / float(n)
+        dW = Xn.T @ G + 2.0 * float(l2) * W
+        db = np.sum(G, axis=0, keepdims=True)
+
+        W -= float(lr) * dW
+        b -= float(lr) * db
+
+        best_loss = min(best_loss, loss)
+
+    metrics = {"final_loss": float(loss), "best_loss": float(best_loss)}
+    return (W, b, mu.astype(np.float32), sd.astype(np.float32), metrics)
+
+
+def _predict_numpy_softmax_regression(
+    X: np.ndarray,
+    W: np.ndarray,
+    b: np.ndarray,
+    mu: np.ndarray,
+    sd: np.ndarray,
+) -> np.ndarray:
+    Xn = (X - mu) / sd
+    P = _softmax(Xn @ W + b)
+    return P
+
+
+# -------------------------------
+# TF model
+# -------------------------------
+
+def _build_tf_model(input_dim: int, output_dim: int, learning_rate: float) -> "models.Model":
     model = models.Sequential([
         layers.Input(shape=(input_dim,)),
         layers.Dense(64, activation="relu"),
@@ -178,71 +250,91 @@ def _build_model(input_dim: int, output_dim: int, learning_rate: float) -> "mode
     return model
 
 
+# -------------------------------
+# Train
+# -------------------------------
+
 def train_model(train_df: pd.DataFrame, cfg: Union[TrainConfig, int, None] = None) -> Dict:
     """
-    Trains the Keras model and writes:
-      - coin_metal_model.keras
-      - coin_metal_model_meta.json
-    to the same folder as nn.py.
+    Trains and saves a metal-composition classifier.
+    - If TensorFlow is available, trains a small Keras model and saves coin_metal_model.keras
+    - Otherwise, trains a lightweight numpy softmax regression and saves coin_metal_model_np.npz
 
-    Supports being called as:
-      train_model(train_df, TrainConfig(...))
-      train_model(train_df, epochs_int)
-      train_model(train_df)
+    Always writes coin_metal_model_meta.json with the feature columns and metal labels.
     """
-    if not HAS_TF:
-        raise RuntimeError("TensorFlow not available (install tensorflow to enable training).")
-
     # Normalize cfg
     if cfg is None:
         cfg = TrainConfig()
     elif isinstance(cfg, int):
         cfg = TrainConfig(epochs=int(cfg))
     elif not isinstance(cfg, TrainConfig):
-        # be forgiving if something dict-like got passed
         try:
             cfg = TrainConfig(**dict(cfg))  # type: ignore
         except Exception:
             cfg = TrainConfig()
 
-    epochs = int(cfg.epochs or 60)
-    epochs = max(1, epochs)
+    epochs = max(1, int(cfg.epochs or 60))
 
-    # Extract arrays
-    X = np.vstack(train_df.drop(columns=["_Y"]).values)
-    Y = np.vstack(train_df["_Y"].values)
+    X = np.vstack(train_df.drop(columns=["_Y"]).values).astype(np.float32)
+    Y = np.vstack(train_df["_Y"].values).astype(np.float32)
 
-    model = _build_model(X.shape[1], Y.shape[1], learning_rate=cfg.learning_rate)
+    # Choose metals list in meta
+    metals = list(cfg.metals) if cfg.metals else DEFAULT_METALS
 
-    hist = model.fit(
-        X, Y,
+    if HAS_TF:
+        model = _build_tf_model(X.shape[1], Y.shape[1], learning_rate=cfg.learning_rate)
+        hist = model.fit(X, Y, epochs=epochs, validation_split=float(cfg.val_split), verbose=0)
+        model.save(str(KERAS_MODEL_PATH))
+
+        meta = {
+            "backend": "tensorflow",
+            "metals": metals,
+            "feat_cols": list(train_df.drop(columns=["_Y"]).columns),
+            "final_loss": float(hist.history["loss"][-1]),
+            "final_val_loss": float(hist.history.get("val_loss", [float("nan")])[-1]),
+        }
+        META_PATH.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+        return {
+            "backend": meta["backend"],
+            "final_loss": meta["final_loss"],
+            "final_val_loss": meta["final_val_loss"],
+            "model_path": str(KERAS_MODEL_PATH),
+            "meta_path": str(META_PATH),
+            "epochs": epochs,
+        }
+
+    # ---- numpy fallback ----
+    W, b, mu, sd, m = _train_numpy_softmax_regression(
+        X=X,
+        Y=Y,
         epochs=epochs,
-        validation_split=float(cfg.val_split),
-        verbose=0
+        lr=float(cfg.learning_rate),
+        l2=float(cfg.l2),
     )
-
-    model.save(MODEL_PATH)
+    np.savez_compressed(str(NP_MODEL_PATH), W=W, b=b, mu=mu, sd=sd)
 
     meta = {
-        "metals": list(cfg.metals) if cfg.metals else DEFAULT_METALS,
+        "backend": "numpy",
+        "metals": metals,
         "feat_cols": list(train_df.drop(columns=["_Y"]).columns),
-        "final_loss": float(hist.history["loss"][-1]),
-        "final_val_loss": float(hist.history.get("val_loss", [float("nan")])[-1]),
+        "final_loss": float(m.get("final_loss", float("nan"))),
+        "final_val_loss": None,  # not computed for numpy fallback
+        "note": "TensorFlow not available; trained numpy softmax regression fallback.",
     }
-    with open(META_PATH, "w", encoding="utf-8") as f:
-        json.dump(meta, f, indent=2)
+    META_PATH.write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
     return {
+        "backend": meta["backend"],
         "final_loss": meta["final_loss"],
         "final_val_loss": meta["final_val_loss"],
-        "model_path": MODEL_PATH,
-        "meta_path": META_PATH,
+        "model_path": str(NP_MODEL_PATH),
+        "meta_path": str(META_PATH),
         "epochs": epochs,
     }
 
 
 # -------------------------------
-# Prediction
+# Predict
 # -------------------------------
 
 def predict_metal_probs(
@@ -255,22 +347,21 @@ def predict_metal_probs(
     color_hint: Optional[str] = None,
 ) -> Dict[str, float]:
     """
-    Loads saved model + meta if available and predicts metal probabilities.
-    If TensorFlow isn't available or the model files don't exist, returns {"unknown": 1.0}.
+    Predict metal probabilities.
+    - Prefer TF model if present & loadable.
+    - Else use numpy fallback model if present.
+    - Else return {"unknown": 1.0}.
     """
-    if not HAS_TF:
+    if not META_PATH.exists():
         return {"unknown": 1.0}
 
-    # If model hasn't been trained/saved yet
-    if not Path(MODEL_PATH).exists() or not Path(META_PATH).exists():
+    meta = json.loads(META_PATH.read_text(encoding="utf-8"))
+    feat_cols = meta.get("feat_cols") or []
+    metals = meta.get("metals") or DEFAULT_METALS
+    if not feat_cols:
         return {"unknown": 1.0}
-
-    model = tf.keras.models.load_model(MODEL_PATH)
-    with open(META_PATH, "r", encoding="utf-8") as f:
-        meta = json.load(f)
 
     density = compute_density_gcm3(mass_g, diameter_mm, thickness_mm, hole_mm)
-
     x = {
         "mass_g": float(mass_g),
         "diameter_mm": float(diameter_mm),
@@ -283,21 +374,40 @@ def predict_metal_probs(
         "color_is_copper": float(any(k in (color_hint or "").lower() for k in ["brown", "copper"])),
         "denom_len": float(len(str(denomination or "")[:64])),
     }
-
-    feat_cols = meta.get("feat_cols") or []
-    if not feat_cols:
-        return {"unknown": 1.0}
-
     X = np.array([[x.get(c, 0.0) for c in feat_cols]], dtype=np.float32)
     X = np.nan_to_num(X, nan=0.0, posinf=40.0, neginf=0.0)
 
-    probs = model.predict(X, verbose=0)[0]
-    probs = np.nan_to_num(probs, nan=0.0)
+    # 1) TensorFlow path
+    if HAS_TF and KERAS_MODEL_PATH.exists():
+        try:
+            model = tf.keras.models.load_model(str(KERAS_MODEL_PATH))
+            probs = model.predict(X, verbose=0)[0]
+            probs = np.nan_to_num(probs, nan=0.0)
+            s = float(probs.sum())
+            if s <= 0:
+                return {"unknown": 1.0}
+            probs = probs / s
+            return {m: float(p) for m, p in zip(metals, probs)}
+        except Exception:
+            # fall through to numpy if TF model can't load
+            pass
 
-    s = float(probs.sum())
-    if s <= 0:
-        return {"unknown": 1.0}
+    # 2) numpy fallback
+    if NP_MODEL_PATH.exists():
+        try:
+            data = np.load(str(NP_MODEL_PATH))
+            W = data["W"]
+            b = data["b"]
+            mu = data["mu"]
+            sd = data["sd"]
+            probs = _predict_numpy_softmax_regression(X, W=W, b=b, mu=mu, sd=sd)[0]
+            probs = np.nan_to_num(probs, nan=0.0)
+            s = float(probs.sum())
+            if s <= 0:
+                return {"unknown": 1.0}
+            probs = probs / s
+            return {m: float(p) for m, p in zip(metals, probs)}
+        except Exception:
+            return {"unknown": 1.0}
 
-    probs = probs / s
-    metals = meta.get("metals") or DEFAULT_METALS
-    return {m: float(p) for m, p in zip(metals, probs)}
+    return {"unknown": 1.0}

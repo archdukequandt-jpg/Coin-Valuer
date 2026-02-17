@@ -1,6 +1,6 @@
 streamlit>=1.30
 pandas>=2.0
-numpy<2.0
+numpy>=1.23
 plotly>=5.18
 matplotlib>=3.7
 reportlab>=4.0
@@ -8,4 +8,3 @@ requests>=2.31
 beautifulsoup4>=4.12
 lxml>=4.9
 pillow>=10.0
-tensorflow==2.15.0
