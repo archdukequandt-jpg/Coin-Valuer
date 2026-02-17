@@ -5,7 +5,6 @@ from typing import Optional, Dict
 import pandas as pd
 import streamlit as st
 
-# Single-folder imports (no coin_valuer package)
 import db
 import match
 import pricing

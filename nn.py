@@ -25,8 +25,12 @@ DEFAULT_METALS = [
     "cobalt", "unknown", "none"
 ]
 
-MODEL_PATH = "models/coin_metal_model.keras"
-META_PATH = "models/coin_metal_model_meta.json"
+from pathlib import Path
+BASE_DIR = Path(__file__).resolve().parent
+MODEL_PATH = str(BASE_DIR / "coin_metal_model.keras")
+META_PATH  = str(BASE_DIR / "coin_metal_model_meta.json")
+
+
 
 
 # -------------------------------

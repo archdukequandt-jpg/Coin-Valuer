@@ -6,7 +6,7 @@ from typing import List, Dict, Optional, Tuple
 
 import pandas as pd
 
-DATA_DIR = Path(__file__).resolve().parents[1] / "data"
+DATA_DIR = Path(__file__).resolve().parent
 SEED_FILE = DATA_DIR / "coin_db_seed.csv"
 CACHE_FILE = DATA_DIR / "coin_db_cache.csv"
 
