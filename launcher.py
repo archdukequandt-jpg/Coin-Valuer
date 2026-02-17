@@ -2,7 +2,7 @@
 import os, sys, socket, subprocess, time, webbrowser, pathlib, signal
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-APP_REL = "coin_valuer/launch.py"
+APP_REL = "launch.py"
 APP = ROOT / APP_REL
 LOGS = ROOT / "logs"
 LOGS.mkdir(parents=True, exist_ok=True)
