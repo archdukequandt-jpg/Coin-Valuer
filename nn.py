@@ -84,8 +84,8 @@ def build_training_frame(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
     Builds a clean, NaN-free training dataframe from the coin DB.
     Uses metal_1..3 + pct_1..3 as labels.
     """
-
     df = df.copy()
+    df = df.reset_index(drop=True)  # ensure 0..N-1 indexing for numpy arrays
 
     metals = DEFAULT_METALS.copy()
     metal_to_idx = {m: i for i, m in enumerate(metals)}
@@ -102,7 +102,6 @@ def build_training_frame(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
         densities.append(dens)
 
     df["density"] = densities
-
     df["year"] = pd.to_numeric(df.get("year_start", 0), errors="coerce").fillna(0).astype(int)
 
     df["color_is_gold"] = df.get("color_hint", "").astype(str).str.contains("gold", case=False).astype(float)
@@ -112,16 +111,8 @@ def build_training_frame(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
     df["denom_len"] = df.get("denomination", "").astype(str).str.slice(0, 64).str.len().astype(float)
 
     feature_cols = [
-        "mass_g",
-        "diameter_mm",
-        "thickness_mm",
-        "hole_mm",
-        "density",
-        "year",
-        "color_is_gold",
-        "color_is_silver",
-        "color_is_copper",
-        "denom_len",
+        "mass_g", "diameter_mm", "thickness_mm", "hole_mm", "density", "year",
+        "color_is_gold", "color_is_silver", "color_is_copper", "denom_len",
     ]
 
     X = df[feature_cols].copy()
@@ -131,11 +122,10 @@ def build_training_frame(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
     # ---- Labels ----
     Y = np.zeros((len(df), len(metals)), dtype=np.float32)
 
-    for i, r in df.iterrows():
+    for i, (_, r) in enumerate(df.iterrows()):
         for m_col, p_col in [("metal_1", "pct_1"), ("metal_2", "pct_2"), ("metal_3", "pct_3")]:
             m = str(r.get(m_col, "unknown")).lower()
             p = float(r.get(p_col, 0.0) or 0.0)
-
             if m in metal_to_idx and p > 0:
                 Y[i, metal_to_idx[m]] += p
 
@@ -146,11 +136,6 @@ def build_training_frame(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
 
     train_df = pd.DataFrame(X, columns=feature_cols)
     train_df["_Y"] = list(Y)
-
-    meta = {
-        "metals": metals,
-        "feat_cols": feature_cols,
-    }
 
     return train_df, metals
 
